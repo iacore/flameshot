@@ -107,6 +107,11 @@ CaptureWidget::CaptureWidget(const CaptureRequest& req,
     setMouseTracking(true);
     initContext(fullScreen, req);
 
+    // Taken before the overlay is mapped: a tiling window manager re-lays out
+    // its windows when it appears, and single-click selection must use the
+    // geometry the user was looking at.
+    m_windowCandidates = WindowPicker::windowsInCurrentWorkspace();
+
     ScreenGrabber grabber;
     QScreen* selectedScreen = nullptr;
 
@@ -178,16 +183,12 @@ CaptureWidget::CaptureWidget(const CaptureRequest& req,
 #else
 // Call cmake with -DFLAMESHOT_DEBUG_CAPTURE=ON to enable easier debugging
 #if !defined(FLAMESHOT_DEBUG_CAPTURE)
-        if (DesktopInfo().waylandDetected()) {
-            setWindowFlags(Qt::BypassWindowManagerHint |
-                           Qt::WindowStaysOnTopHint | Qt::FramelessWindowHint |
-                           Qt::Tool);
-        } else {
-            // Note: Qt::BypassWindowManagerHint is removed to fix x11 gnome
-            // crash. It's needed on Cosmic
-            setWindowFlags(Qt::WindowStaysOnTopHint | Qt::FramelessWindowHint |
-                           Qt::Tool);
-        }
+        // Override-redirect keeps the overlay out of the window manager. A
+        // tiling WM would otherwise place it into its layout before the
+        // fullscreen state takes effect, showing a capture UI laid out for the
+        // screen inside a smaller tile.
+        setWindowFlags(Qt::BypassWindowManagerHint | Qt::WindowStaysOnTopHint |
+                       Qt::FramelessWindowHint | Qt::Tool);
 #endif
 
         // Always display on the selected screen (not spanning entire desktop)
@@ -1076,7 +1077,18 @@ void CaptureWidget::mouseReleaseEvent(QMouseEvent* e)
 
 void CaptureWidget::selectWindowAt(const QPoint& pos)
 {
-    const QRect windowRect = WindowPicker::windowRectAt(mapToGlobal(pos));
+    const QPoint globalPos = mapToGlobal(pos);
+    QRect windowRect;
+    for (const QRect& candidate : m_windowCandidates) {
+        if (candidate.contains(globalPos)) {
+            windowRect = candidate;
+            break;
+        }
+    }
+    if (windowRect.isNull()) {
+        // No snapshot (a platform without enumeration): ask the live stack
+        windowRect = WindowPicker::windowRectAt(globalPos);
+    }
     if (windowRect.isNull()) {
         return;
     }

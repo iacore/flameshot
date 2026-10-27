@@ -24,6 +24,7 @@
 #include <QPointer>
 #include <QTimer>
 #include <QUndoStack>
+#include <QVector>
 #include <QWidget>
 
 class QLabel;
@@ -216,6 +217,9 @@ private:
 
     QPoint m_mousePressedPos;
     QPoint m_activeToolOffsetToMouseOnStart;
+    // Window rectangles of the current workspace, taken before the overlay is
+    // mapped so a tiling window manager cannot change them under us.
+    QVector<QRect> m_windowCandidates;
 
     // XYWH display position and timer
     bool m_xywhDisplay;

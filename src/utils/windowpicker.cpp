@@ -93,48 +93,70 @@ BOOL CALLBACK pickWindowProc(HWND hwnd, LPARAM lparam)
 
 #elif defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
 
-bool isOwnWindow(xcb_connection_t* connection,
-                 xcb_window_t window,
-                 xcb_atom_t pidAtom)
-{
-    if (pidAtom == XCB_ATOM_NONE) {
-        return false;
-    }
-    xcb_get_property_reply_t* reply = xcb_get_property_reply(
-      connection,
-      xcb_get_property(connection, 0, window, pidAtom, XCB_ATOM_CARDINAL, 0, 1),
-      nullptr);
-    if (reply == nullptr) {
-        return false;
-    }
-    bool own = false;
-    if (reply->format == 32 && xcb_get_property_value_length(reply) >= 4) {
-        const auto pid =
-          *reinterpret_cast<const uint32_t*>(xcb_get_property_value(reply));
-        own = pid == static_cast<uint32_t>(getpid());
-    }
-    free(reply);
-    return own;
-}
-
 struct WindowRect
 {
-    bool valid = false;
     int x = 0;
     int y = 0;
     int width = 0;
     int height = 0;
 };
 
-/**
- * Top-most viewable top-level window (direct child of the root window)
- * containing the point, in root (physical pixel) coordinates. Windows owned by
- * this process are skipped so the capture overlay does not shadow what is
- * below it.
- */
-WindowRect topLevelWindowAt(int x, int y)
+xcb_atom_t internAtom(xcb_connection_t* connection, const char* name)
 {
-    WindowRect result;
+    xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(
+      connection,
+      xcb_intern_atom(connection, 0, std::strlen(name), name),
+      nullptr);
+    const xcb_atom_t atom = reply ? reply->atom : XCB_ATOM_NONE;
+    free(reply);
+    return atom;
+}
+
+uint32_t cardinalProperty(xcb_connection_t* connection,
+                          xcb_window_t window,
+                          xcb_atom_t atom,
+                          bool& found)
+{
+    found = false;
+    if (atom == XCB_ATOM_NONE) {
+        return 0;
+    }
+    xcb_get_property_reply_t* reply = xcb_get_property_reply(
+      connection,
+      xcb_get_property(connection, 0, window, atom, XCB_ATOM_CARDINAL, 0, 1),
+      nullptr);
+    if (reply == nullptr) {
+        return 0;
+    }
+    uint32_t value = 0;
+    if (reply->format == 32 && xcb_get_property_value_length(reply) >= 4) {
+        value =
+          *reinterpret_cast<const uint32_t*>(xcb_get_property_value(reply));
+        found = true;
+    }
+    free(reply);
+    return value;
+}
+
+bool isOwnWindow(xcb_connection_t* connection,
+                 xcb_window_t window,
+                 xcb_atom_t pidAtom)
+{
+    bool found = false;
+    const uint32_t pid = cardinalProperty(connection, window, pidAtom, found);
+    return found && pid == static_cast<uint32_t>(getpid());
+}
+
+/**
+ * Viewable top-level windows (direct children of the root window), top-most
+ * first, in root (physical pixel) coordinates. Windows owned by this process
+ * are skipped so the capture overlay does not shadow what is below it. With
+ * @p currentWorkspaceOnly the list is restricted to the current desktop,
+ * keeping windows that are sticky (`_NET_WM_DESKTOP` 0xFFFFFFFF).
+ */
+QVector<WindowRect> topLevelWindows(bool currentWorkspaceOnly)
+{
+    QVector<WindowRect> result;
     xcb_connection_t* connection = xcb_connect(nullptr, nullptr);
     if (xcb_connection_has_error(connection)) {
         xcb_disconnect(connection);
@@ -148,13 +170,19 @@ WindowRect topLevelWindowAt(int x, int y)
     }
     const xcb_window_t root = screens.data->root;
 
-    static constexpr char PID_ATOM[] = "_NET_WM_PID";
-    xcb_intern_atom_reply_t* atomReply = xcb_intern_atom_reply(
-      connection,
-      xcb_intern_atom(connection, 0, std::strlen(PID_ATOM), PID_ATOM),
-      nullptr);
-    const xcb_atom_t pidAtom = atomReply ? atomReply->atom : XCB_ATOM_NONE;
-    free(atomReply);
+    const xcb_atom_t pidAtom = internAtom(connection, "_NET_WM_PID");
+    xcb_atom_t desktopAtom = XCB_ATOM_NONE;
+    bool haveDesktop = false;
+    uint32_t currentDesktop = 0;
+    if (currentWorkspaceOnly) {
+        currentDesktop =
+          cardinalProperty(connection,
+                           root,
+                           internAtom(connection, "_NET_CURRENT_DESKTOP"),
+                           haveDesktop);
+        desktopAtom = internAtom(connection, "_NET_WM_DESKTOP");
+        currentWorkspaceOnly = haveDesktop && desktopAtom != XCB_ATOM_NONE;
+    }
 
     xcb_query_tree_reply_t* tree = xcb_query_tree_reply(
       connection, xcb_query_tree(connection, root), nullptr);
@@ -183,21 +211,25 @@ WindowRect topLevelWindowAt(int x, int y)
             if (geometry == nullptr) {
                 continue;
             }
-            const bool contains = x >= geometry->x && y >= geometry->y &&
-                                  x < geometry->x + geometry->width &&
-                                  y < geometry->y + geometry->height;
-            const bool usable = geometry->width > 0 && geometry->height > 0;
-            if (contains && usable &&
-                !isOwnWindow(connection, candidate, pidAtom)) {
-                result.valid = true;
-                result.x = geometry->x;
-                result.y = geometry->y;
-                result.width = geometry->width;
-                result.height = geometry->height;
-                free(geometry);
-                break;
-            }
+            WindowRect window{
+                geometry->x, geometry->y, geometry->width, geometry->height
+            };
+            const bool usable = window.width > 0 && window.height > 0;
             free(geometry);
+            if (!usable || isOwnWindow(connection, candidate, pidAtom)) {
+                continue;
+            }
+            if (currentWorkspaceOnly) {
+                bool hasWindowDesktop = false;
+                const uint32_t windowDesktop = cardinalProperty(
+                  connection, candidate, desktopAtom, hasWindowDesktop);
+                constexpr uint32_t STICKY = 0xFFFFFFFFu;
+                if (hasWindowDesktop && windowDesktop != STICKY &&
+                    windowDesktop != currentDesktop) {
+                    continue;
+                }
+            }
+            result.append(window);
         }
         free(tree);
     }
@@ -235,17 +267,44 @@ QRect WindowPicker::windowRectAt(const QPoint& globalPos)
     }
     QScreen* screen = QGuiApplication::screenAt(globalPos);
     const qreal dpr = screen ? screen->devicePixelRatio() : 1.0;
-    const WindowRect window = topLevelWindowAt(qRound(globalPos.x() * dpr),
-                                               qRound(globalPos.y() * dpr));
-    if (!window.valid) {
-        return {};
+    const int x = qRound(globalPos.x() * dpr);
+    const int y = qRound(globalPos.y() * dpr);
+    const QVector<WindowRect> windows = topLevelWindows(false);
+    for (const WindowRect& window : windows) {
+        if (x >= window.x && y >= window.y && x < window.x + window.width &&
+            y < window.y + window.height) {
+            return QRect(qRound(window.x / dpr),
+                         qRound(window.y / dpr),
+                         qRound(window.width / dpr),
+                         qRound(window.height / dpr));
+        }
     }
-    return QRect(qRound(window.x / dpr),
-                 qRound(window.y / dpr),
-                 qRound(window.width / dpr),
-                 qRound(window.height / dpr));
+    return {};
 #else
     Q_UNUSED(globalPos)
+    return {};
+#endif
+}
+
+QVector<QRect> WindowPicker::windowsInCurrentWorkspace()
+{
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+        return {};
+    }
+    QScreen* primary = QGuiApplication::primaryScreen();
+    const qreal dpr = primary ? primary->devicePixelRatio() : 1.0;
+    QVector<QRect> result;
+    const QVector<WindowRect> windows = topLevelWindows(true);
+    result.reserve(windows.size());
+    for (const WindowRect& window : windows) {
+        result.append(QRect(qRound(window.x / dpr),
+                            qRound(window.y / dpr),
+                            qRound(window.width / dpr),
+                            qRound(window.height / dpr)));
+    }
+    return result;
+#else
     return {};
 #endif
 }
